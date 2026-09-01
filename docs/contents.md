@@ -22,7 +22,7 @@
 | 成员 | 说明 |
 |------|------|
 | `GekitoLibKeywords.Weld` | 共享焊接关键词（`[CustomEnum]` 注入，所有 Mod 共用同一实例，跨 Mod 的焊接牌可互相连锁；定义于 `GekitoLib.Keywords`）。本地化 key：`GEKITOLIB-WELD` |
-| `KeywordChainPlay` | 连锁引擎。内置已注册 Weld；其他 Mod 可用 `KeywordChainPlay.Register(keyword, piles...)` 注册自己的连锁关键词（piles 缺省为 手牌/弃牌堆/抽牌堆） |
+| `KeywordChainPlay` | 连锁引擎。内置已注册 Weld；其他 Mod 可用 `KeywordChainPlay.Register(keyword, piles...)` 注册自己的连锁关键词（piles 缺省为 手牌/弃牌堆/抽牌堆）；可用 `KeywordChainPlay.RegisterVirtualKeyword(provider)` 注册「虚拟连锁关键词」让指定牌无需物理关键词即可触发连锁（见下） |
 | `DaoGuan`（`GekitoLib.Enchantments`） | 导管附魔：为攻击/技能牌添加「焊接」关键词。本地化 key：`GEKITOLIB-DAO_GUAN` |
 
 **实现要点**（改动机制前必读）：
@@ -30,12 +30,19 @@
 - 连锁打出的牌带防重入标记，其打出不再触发连锁；其他效果（AutoPlay 等）打出的焊接牌仍可正常触发连锁。
 - X 费牌（能量 X 或辉星 X）连锁时先 `SpendResources()` 再 `AutoPlay(skipXCapture: true)`。
 - 原目标已死时以 null 目标 AutoPlay。
+- **虚拟连锁关键词**（`RegisterVirtualKeyword`）：为满足条件的牌提供临时的连锁关键词集合，**不写入卡牌 Keywords 状态**，取代「临时 `ApplyKeyword` + 检测后 `RemoveKeyword`」的做法。收益：①异常/中断也不会残留关键词；②不触发 `CardCmd.ApplyKeyword/RemoveKeyword` 的卡面刷新（`NCard.UpdateVisuals`），避免多人选择界面挂载期间节点脱离树引发原版 reparent 崩溃；③不依赖 Harmony Postfix 相对顺序。提供者签名 `(CardModel, bool isAutoPlay)`——需要「仅手动打出触发」时必须用 `!isAutoPlay` 短路（等价旧方案 Prefix 的检查）；提供者须为纯函数（幂等、无副作用），在连锁检测时同步求值；触发判定与候选匹配统一按「物理 ∪ 虚拟」关键词计算。
+- ⚠️ **CustomEnum 注入时序陷阱（实测必踩）**：`GekitoLibKeywords.Weld` 是 BaseLib `[CustomEnum]` 静态字段，真实枚举值由 BaseLib 在 **ModelDb.Init 时**注入（`GenEnumValues` Prefix）——**晚于所有 mod 的 Initialize**。任何在 Initialize/静态构造阶段读取该字段拿到的都是占位值 `default(CardKeyword)=0`；若用它作字典 key（如 `Register(GekitoLibKeywords.Weld)`）缓存下来，运行时卡牌/提供者返回的「注入后真实值」将永远匹配不上 → **连锁全部静默失效**（物理/虚拟皆然，且无任何报错）。因此内置 Weld 采用**惰性注册**（`EnsureBuiltinRegistered`，首次 Postfix 时才读字段注册）；使用方 `Register(keyword, ...)` 自定义连锁关键词时，同样必须保证调用发生在 ModelDb.Init（注入完成）之后。
 
 **典型用法**：
 
 ```csharp
 // 卡牌效果：为一张牌添加「焊接」
 CardCmd.ApplyKeyword(card, GekitoLibKeywords.Weld);
+
+// Power：让「每回合前 N 张手动打出的牌」触发焊接连锁（不写卡牌状态，无需清理）
+KeywordChainPlay.RegisterVirtualKeyword(static (card, isAutoPlay) =>
+    !isAutoPlay && card.Owner?.Creature?.GetPower<WeldingPower>() is { } power && power.ShouldProvideVirtualWeld(card)
+        ? [GekitoLibKeywords.Weld] : []);
 
 // 遗物：从牌组选牌附魔「导管」
 var enchantment = ModelDb.Enchantment<DaoGuan>();
@@ -195,11 +202,12 @@ await PowerCmd.Apply<LayeredArmorPower>(choiceContext, Owner.Creature, stacks, O
 
 | 成员 | 说明 |
 |------|------|
-| `ColorfulPhilosophersPools.AddPool(Type)` / `AddPool<TPool>()` | 注册候选池（按类型、重复注册忽略）。使用方还要在自己的本地化提供事件选项文案：`COLORFUL_PHILOSOPHERS.pages.INITIAL.options.<卡池 EnergyColorName 大写>` |
+| `ColorfulPhilosophersPools.AddPool(Type)` / `AddPool<TPool>()` | 注册候选池（按类型、重复注册忽略）。使用方还要在自己的本地化提供事件选项文案，key 为两条带后缀的完整 key：`COLORFUL_PHILOSOPHERS.pages.INITIAL.options.<EnergyColorName 大写>.title` 与 `.description`（见下方 key 结构） |
 | `ColorfulPhilosophersPatch`（`GekitoLib.Patches`） | Postfix `get_CardPoolColorOrder`，把已注册的池追加进返回列表（幂等） |
 
 **实现要点**（改动机制前必读）：
 - 注册表存**类型**而非模型实例，Postfix 触发时（游戏运行中）才经 `ModelDb` 解析成卡池实例：ModInitializer 阶段模型尚未注册进 ModelDb，此时查 `ModelDb.CardPool<T>()` 会抛 `ModelNotFoundException`（实测曾致 mod 初始化中断、事件选项与后续注册全部失效）。
+- **事件选项本地化 key 结构（实测，缺一即 NRE 卡死）**：`EnergyColorName` 由 BaseLib `CustomCardPoolModel` 给出，等于 `Id.Category + "∴" + Id.Entry`——分隔符是**单个 `∴`（U+2234）**，不是西里尔字母、不是 ASCII `-`；`Category` 是卡池类型 slug（如 `CARD_POOL`），`Entry` 是 BaseLib 给 mod 卡池加 modId 前缀后的 slug（如 `JTYSMOD2-Y_Y60_CARD_POOL`），全部大写。最终 key 示例：`COLORFUL_PHILOSOPHERS.pages.INITIAL.options.CARD_POOL∴JTYSMOD2-Y_Y60_CARD_POOL.title` 与 `.description`。原版 `EventOption` 构造器只查 `key + ".title"` / `key + ".description"`（`LocString.GetIfExists`），缺后缀、分隔符/前缀任一不匹配 → 返回 null → `AddDetailsTo(null)` NRE → **事件初始化中断卡死**（影响所有角色的该事件，不止 mod 角色）。排查 key 不匹配最快路径是加诊断日志打印运行时实际 `EnergyColorName`，不要靠猜。
 
 **典型用法**：
 
